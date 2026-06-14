@@ -15,7 +15,6 @@ import { INITIAL_STATIONS } from './initialData';
 import { DetailsModal } from './components/DetailsModal';
 import { AdminPanel } from './components/AdminPanel';
 import { SleepOverlay } from './components/SleepOverlay';
-import { OfflineMap } from './components/OfflineMap';
 import { db, isFirebaseEnabled, handleFirestoreError, OperationType } from './firebase';
 import { collection, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
 
@@ -28,9 +27,10 @@ export default function App() {
   const [isMapOffline, setIsMapOffline] = useState(false);
   const [mapLibraryLoaded, setMapLibraryLoaded] = useState(false);
 
-  // Map Provider Selector State: 'leaflet' (Default: real OSM map) | 'yandex' (Requires key) | 'offline' (Vector fallback)
-  const [mapProvider, setMapProvider] = useState<'leaflet' | 'yandex' | 'offline'>(() => {
+  // Map Provider Selector State: 'leaflet' (Default: real OSM map) | 'yandex' (Requires key)
+  const [mapProvider, setMapProvider] = useState<'leaflet' | 'yandex'>(() => {
     const saved = localStorage.getItem('preferred_map_provider');
+    if (saved === 'offline') return 'leaflet';
     return (saved as any) || 'leaflet';
   });
   
@@ -425,7 +425,7 @@ export default function App() {
   }, [sleepStart, sleepEnd, sleepBypassed]);
 
   // Helper to change map provider and persist it
-  const handleMapProviderChange = (provider: 'leaflet' | 'yandex' | 'offline') => {
+  const handleMapProviderChange = (provider: 'leaflet' | 'yandex') => {
     setMapProvider(provider);
     localStorage.setItem('preferred_map_provider', provider);
   };
@@ -457,6 +457,13 @@ export default function App() {
         const initializedMap = L.map(leafletContainerRef.current, {
           center: [56.4977, 84.9744], // Center broadly near Russia / Tomsk TSUN
           zoom: 4,
+          minZoom: 3,
+          maxZoom: 16,
+          maxBounds: [
+            [25.0, -10.0], // South-West corner (fits Eurasia / Russia comfortably)
+            [78.0, 180.0]  // North-East corner (caps arctic/siberian bounds)
+          ],
+          maxBoundsViscosity: 1.0, // Strictly enforce bounds so dragging doesn't bounce/go outside
           zoomControl: true,
           attributionControl: true
         });
@@ -574,7 +581,21 @@ export default function App() {
 
   // 6. Yandex Maps Rendering and Updating lifecycle
   useEffect(() => {
-    if (isMapOffline || !mapLibraryLoaded) return;
+    // If map provider is not Yandex, make sure we clean up the stale instance
+    if (mapProvider !== 'yandex' || isMapOffline) {
+      if (mapRef.current) {
+        try {
+          mapRef.current.destroy();
+        } catch (e) {
+          console.error("Failed to destroy Yandex map instance during cleanup:", e);
+        }
+        mapRef.current = null;
+        geoObjectsGroupRef.current = null;
+      }
+      return;
+    }
+
+    if (!mapLibraryLoaded) return;
     // If we have Yandex script, initialize map container
     if (!mapContainerRef.current) return;
     const ymaps = (window as any).ymaps;
@@ -625,7 +646,20 @@ export default function App() {
         setIsMapOffline(true);
       }
     });
-  }, [stations, mapLibraryLoaded, isMapOffline]);
+
+    // Clean up on unmount or supplier change
+    return () => {
+      if (mapRef.current) {
+        try {
+          mapRef.current.destroy();
+        } catch (e) {
+          console.error("Failed to destroy Yandex map instance in unmount cleanup:", e);
+        }
+        mapRef.current = null;
+        geoObjectsGroupRef.current = null;
+      }
+    };
+  }, [stations, mapLibraryLoaded, isMapOffline, mapProvider]);
 
   // Track map marker updates separately when station array changes
   useEffect(() => {
@@ -858,31 +892,10 @@ export default function App() {
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>Яндекс.Карты</span>
               </button>
-              <button
-                onClick={() => handleMapProviderChange('offline')}
-                className={`px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
-                  mapProvider === 'offline'
-                    ? 'bg-[#00509A] text-white shadow-md font-bold'
-                    : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-                }`}
-                title="Схематичная интерактивная оффлайн-карта с портом для работы полностью без интернета"
-              >
-                <SlidersHorizontal className="w-3.5 h-3.5" />
-                <span>Оффлайн схема</span>
-              </button>
             </div>
 
             {/* 2. Choose and Render Map Instance */}
-            {mapProvider === 'offline' ? (
-              <OfflineMap
-                stations={stations}
-                activeDetails={activeDetails}
-                setActiveDetails={setActiveDetails}
-                searchQuery={searchQuery}
-                filterType={filterType}
-                theme={theme}
-              />
-            ) : mapProvider === 'leaflet' ? (
+            {mapProvider === 'leaflet' ? (
               <>
                 {/* Leaflet Interactive Map Container */}
                 <div id="leaflet-map" ref={leafletContainerRef} className="w-full h-full relative z-10" style={{ minHeight: '350px' }}></div>
