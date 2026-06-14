@@ -107,7 +107,10 @@ export default function App() {
 
     if (!script) {
       script = document.createElement('script');
-      script.src = 'https://api-maps.yandex.ru/2.1/?lang=ru_RU';
+      const apiKey = (import.meta as any).env?.VITE_YANDEX_MAPS_API_KEY || '09b6bd2c-94e2-4ad3-9935-858f6f817b09';
+      script.src = apiKey 
+        ? `https://api-maps.yandex.ru/2.1/?apikey=${apiKey}&lang=ru_RU`
+        : 'https://api-maps.yandex.ru/2.1/?lang=ru_RU';
       script.type = 'text/javascript';
       script.async = true;
       isNewlyCreated = true;
