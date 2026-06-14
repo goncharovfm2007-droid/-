@@ -8,7 +8,7 @@ import {
   Atom, ShieldCheck, Sun, Moon, Sparkles, SlidersHorizontal, 
   MapPin, Keyboard, MonitorPlay, KeyRound, Search, FileDown, 
   CornerRightDown, Loader2, RefreshCw, Star, Info, HelpCircle, X,
-  Maximize, Minimize
+  Maximize, Minimize, Globe
 } from 'lucide-react';
 import { Station } from './types';
 import { INITIAL_STATIONS } from './initialData';
@@ -27,6 +27,12 @@ export default function App() {
   // Yandex Maps script states & Offline detection
   const [isMapOffline, setIsMapOffline] = useState(false);
   const [mapLibraryLoaded, setMapLibraryLoaded] = useState(false);
+
+  // Map Provider Selector State: 'leaflet' (Default: real OSM map) | 'yandex' (Requires key) | 'offline' (Vector fallback)
+  const [mapProvider, setMapProvider] = useState<'leaflet' | 'yandex' | 'offline'>(() => {
+    const saved = localStorage.getItem('preferred_map_provider');
+    return (saved as any) || 'leaflet';
+  });
   
   // Admin & UI panel states
   const [isAdminOpen, setIsAdminOpen] = useState(false);
@@ -45,6 +51,11 @@ export default function App() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const geoObjectsGroupRef = useRef<any>(null);
   const placemarksRef = useRef<Record<string, any>>({});
+
+  // Leaflet Map Refs
+  const leafletContainerRef = useRef<HTMLDivElement>(null);
+  const leafletMapRef = useRef<any>(null);
+  const leafletMarkersRef = useRef<any[]>([]);
 
   // Loading indicator for Firebase remote sync
   const [isSyncing, setIsSyncing] = useState(false);
@@ -413,6 +424,154 @@ export default function App() {
     return () => clearInterval(interval);
   }, [sleepStart, sleepEnd, sleepBypassed]);
 
+  // Helper to change map provider and persist it
+  const handleMapProviderChange = (provider: 'leaflet' | 'yandex' | 'offline') => {
+    setMapProvider(provider);
+    localStorage.setItem('preferred_map_provider', provider);
+  };
+
+  // 6b. Leaflet Map Rendering and Updating Lifecycle
+  useEffect(() => {
+    if (mapProvider !== 'leaflet') {
+      if (leafletMapRef.current) {
+        try {
+          leafletMapRef.current.remove();
+        } catch (e) {
+          console.error("Failed to remove Leaflet map instance:", e);
+        }
+        leafletMapRef.current = null;
+      }
+      return;
+    }
+
+    if (!leafletContainerRef.current) return;
+    const L = (window as any).L;
+    if (!L) {
+      console.warn('Leaflet global library L is not yet loaded.');
+      return;
+    }
+
+    // Creating Leaflet Map instance
+    if (!leafletMapRef.current) {
+      try {
+        const initializedMap = L.map(leafletContainerRef.current, {
+          center: [56.4977, 84.9744], // Center broadly near Russia / Tomsk TSUN
+          zoom: 4,
+          zoomControl: true,
+          attributionControl: true
+        });
+
+        // Add CartoDB Voyager tiles (very clean look, full vector details)
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+          subdomains: 'abcd',
+          maxZoom: 20
+        }).addTo(initializedMap);
+
+        leafletMapRef.current = initializedMap;
+      } catch (err) {
+        console.error("Failed to configure Leaflet map container: ", err);
+        return;
+      }
+    }
+
+    // Process and sync active markers on Leaflet
+    const activeQuery = searchQuery.toLowerCase().trim();
+    const filtered = stations.filter(s => {
+      const matchQuery = !activeQuery || 
+        s.name.toLowerCase().includes(activeQuery) || 
+        (s.city && s.city.toLowerCase().includes(activeQuery)) || 
+        s.shortInfo.toLowerCase().includes(activeQuery);
+
+      const matchType = filterType === 'all' || s.type === filterType;
+      return matchQuery && matchType;
+    });
+
+    // Remove existing markers before rendering new ones
+    leafletMarkersRef.current.forEach((m) => {
+      try {
+        m.remove();
+      } catch (err) {
+        console.error("Leaflet marker clear error: ", err);
+      }
+    });
+    leafletMarkersRef.current = [];
+
+    const bounds: any[] = [];
+
+    filtered.forEach((s) => {
+      let color = '#00509A'; // Rosatom Blue
+      if (s.type === 'tpu') {
+        color = '#007A33'; // TPU Green
+      } else if (s.type === 'joint') {
+        color = '#7e22ce'; // Joint Purple
+      }
+
+      const iconHtml = `
+        <div class="relative flex items-center justify-center" style="width: 32px; height: 32px;">
+          <div class="absolute inset-0 rounded-full animate-ping opacity-25" style="background-color: ${color}; animation-duration: 2s;"></div>
+          <div class="w-7 h-7 rounded-full bg-white flex items-center justify-center shadow-lg border-2 hover:scale-110 transition-transform" style="border-color: ${color};">
+            <div class="w-4 h-4 rounded-full flex items-center justify-center text-white" style="background-color: ${color}; font-size: 8px; font-weight: bold;">
+              ☢
+            </div>
+          </div>
+        </div>
+      `;
+
+      const customIcon = L.divIcon({
+        html: iconHtml,
+        className: 'custom-leaflet-pin',
+        iconSize: [32, 32],
+        iconAnchor: [16, 16],
+        popupAnchor: [0, -14]
+      });
+
+      // HTML template for popup card inside Leaflet map
+      const badgeBorder = s.type === 'rosatom' ? '#dae6f5' : s.type === 'tpu' ? '#d1e7dd' : '#ebd9fc';
+      const badgeBg = s.type === 'rosatom' ? '#eff6ff' : s.type === 'tpu' ? '#f8fdfa' : '#faf5ff';
+      const badgeColor = s.type === 'rosatom' ? '#00509A' : s.type === 'tpu' ? '#007A33' : '#7e22ce';
+      const badgeLabel = s.type === 'rosatom' ? 'ГК РОСАТОМ' : s.type === 'tpu' ? 'ТПУ' : 'СОВМЕСТНО';
+      const btnBg = s.type === 'rosatom' ? '#00509A' : s.type === 'tpu' ? '#007A33' : '#7e22ce';
+
+      const popupHtml = `
+        <div style="font-family: system-ui, -apple-system, sans-serif; color: #1e293b; min-width: 250px; max-width: 300px; padding: 4px;">
+          <strong style="font-size: 13px; color: #1e293b; display: block; margin-bottom: 6px;">${s.name}</strong>
+          <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
+            <span style="font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 4px; border: 1px solid ${badgeBorder}; background-color: ${badgeBg}; color: ${badgeColor};">
+              ${badgeLabel}
+            </span>
+            ${s.city ? `<span style="font-size: 10px; color: #64748b; font-weight: 600;">📍 ${s.city}</span>` : ''}
+          </div>
+          <p style="font-size: 11.5px; color: #475569; line-height: 1.4; margin: 0 0 10px 0; max-height: 90px; overflow-y: auto;">
+            ${s.shortInfo}
+          </p>
+          <div style="display: flex; justify-content: space-between; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 4px 8px; font-family: monospace; font-size: 9px; color: #64748b; margin-bottom: 12px;">
+            <span>ШИР: <strong>${s.lat.toFixed(5)}</strong></span>
+            <span>ДОЛГ: <strong>${s.lon.toFixed(5)}</strong></span>
+          </div>
+          <button onclick="if(window.openStationDetails) { window.openStationDetails('${s.id}'); }" style="width: 100%; text-align: center; background-color: ${btnBg}; color: white; border: none; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 12px; border-radius: 4px; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,0.05); transition: background-color 0.2s;">
+            Получить полную информацию
+          </button>
+        </div>
+      `;
+
+      const marker = L.marker([s.lat, s.lon], { icon: customIcon })
+        .bindPopup(popupHtml)
+        .addTo(leafletMapRef.current);
+
+      leafletMarkersRef.current.push(marker);
+      bounds.push([s.lat, s.lon]);
+    });
+
+    if (bounds.length > 0 && leafletMapRef.current) {
+      try {
+        leafletMapRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 10 });
+      } catch (xe) {
+        console.warn("Could not fit Leaflet bounds:", xe);
+      }
+    }
+  }, [stations, searchQuery, filterType, mapProvider]);
+
   // 6. Yandex Maps Rendering and Updating lifecycle
   useEffect(() => {
     if (isMapOffline || !mapLibraryLoaded) return;
@@ -425,43 +584,48 @@ export default function App() {
     }
 
     ymaps.ready(() => {
-      // Hide loading overlay pane
-      const loaderPane = document.getElementById('map-loading-pane');
-      if (loaderPane) {
-        loaderPane.style.opacity = '0';
-        setTimeout(() => {
-          loaderPane.style.display = 'none';
-        }, 600);
+      try {
+        // Hide loading overlay pane
+        const loaderPane = document.getElementById('map-loading-pane');
+        if (loaderPane) {
+          loaderPane.style.opacity = '0';
+          setTimeout(() => {
+            if (loaderPane) loaderPane.style.display = 'none';
+          }, 600);
+        }
+
+        // If map instance is already created, skip creating and just refresh markers
+        if (mapRef.current) return;
+
+        const initializedMap = new ymaps.Map(mapContainerRef.current, {
+          center: [55.0, 75.0], // Broadly centered to fit Eurasia scale
+          zoom: 4,
+          controls: ['zoomControl', 'typeSelector', 'fullscreenControl']
+        }, {
+          restrictMapArea: [
+            [25.0, -10.0], // South-West corner (limits scrolling too far south/west)
+            [78.0, 180.0]  // North-East corner (keeps North pole grey areas hidden)
+          ],
+          minZoom: 3,
+          maxZoom: 16,
+          avoidFractionalZoom: true
+        });
+
+        // Create a collection holding geo-points
+        const geoObjects = new ymaps.GeoObjectCollection(null, {});
+        initializedMap.geoObjects.add(geoObjects);
+
+        mapRef.current = initializedMap;
+        geoObjectsGroupRef.current = geoObjects;
+
+        // Force updating placemarks for the first run
+        refreshPins();
+      } catch (err) {
+        console.error("Failed to initialize Yandex Map, falling back to offline mode:", err);
+        setIsMapOffline(true);
       }
-
-      // If map instance is already created, skip creating and just refresh markers
-      if (mapRef.current) return;
-
-      const initializedMap = new ymaps.Map(mapContainerRef.current, {
-        center: [55.0, 75.0], // Broadly centered to fit Eurasia scale
-        zoom: 4,
-        controls: ['zoomControl', 'typeSelector', 'fullscreenControl']
-      }, {
-        restrictMapArea: [
-          [25.0, -10.0], // South-West corner (limits scrolling too far south/west)
-          [78.0, 180.0]  // North-East corner (keeps North pole grey areas hidden)
-        ],
-        minZoom: 3,
-        maxZoom: 16,
-        avoidFractionalZoom: true
-      });
-
-      // Create a collection holding geo-points
-      const geoObjects = new ymaps.GeoObjectCollection(null, {});
-      initializedMap.geoObjects.add(geoObjects);
-
-      mapRef.current = initializedMap;
-      geoObjectsGroupRef.current = geoObjects;
-
-      // Force updating placemarks for the first run
-      refreshPins();
     });
-  }, [stations]);
+  }, [stations, mapLibraryLoaded, isMapOffline]);
 
   // Track map marker updates separately when station array changes
   useEffect(() => {
@@ -668,7 +832,48 @@ export default function App() {
 
           {/* Map display workspace and information overlays */}
           <main className="flex-1 h-full relative flex flex-col min-w-0">
-            {isMapOffline ? (
+            {/* 1. Map Type Switcher Floating Control Bar (Always visible and accessible) */}
+            <div className="absolute top-4 left-4 z-40 bg-white/95 border border-slate-300 backdrop-blur rounded shadow-xl p-1 flex items-center gap-1 select-none pointer-events-auto">
+              <button
+                onClick={() => handleMapProviderChange('leaflet')}
+                className={`px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
+                  mapProvider === 'leaflet'
+                    ? 'bg-[#00509A] text-white shadow-md font-bold'
+                    : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                }`}
+                title="Обычная реальная карта (Картография OpenStreetMap) — работает гарантированно отовсюду"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                <span>Реальная карта (OSM)</span>
+              </button>
+              <button
+                onClick={() => handleMapProviderChange('yandex')}
+                className={`px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
+                  mapProvider === 'yandex'
+                    ? 'bg-[#00509A] text-white shadow-md font-bold'
+                    : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                }`}
+                title="Официальные Яндекс.Карты (требуется рабочий API-ключ разработчика)"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Яндекс.Карты</span>
+              </button>
+              <button
+                onClick={() => handleMapProviderChange('offline')}
+                className={`px-3 py-1.5 rounded text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
+                  mapProvider === 'offline'
+                    ? 'bg-[#00509A] text-white shadow-md font-bold'
+                    : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                }`}
+                title="Схематичная интерактивная оффлайн-карта с портом для работы полностью без интернета"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                <span>Оффлайн схема</span>
+              </button>
+            </div>
+
+            {/* 2. Choose and Render Map Instance */}
+            {mapProvider === 'offline' ? (
               <OfflineMap
                 stations={stations}
                 activeDetails={activeDetails}
@@ -677,14 +882,67 @@ export default function App() {
                 filterType={filterType}
                 theme={theme}
               />
+            ) : mapProvider === 'leaflet' ? (
+              <>
+                {/* Leaflet Interactive Map Container */}
+                <div id="leaflet-map" ref={leafletContainerRef} className="w-full h-full relative z-10" style={{ minHeight: '350px' }}></div>
+
+                {/* Floating Top Cloud Sync Banner on the Map */}
+                <div className="absolute top-4 right-4 z-20 pointer-events-none">
+                  <div className="bg-white/90 border border-slate-300 backdrop-blur rounded px-3 py-1 flex items-center gap-3 shadow-sm text-slate-700 font-mono">
+                    <span className="text-[9px] text-slate-400 uppercase tracking-wider font-bold">ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ:</span>
+                    <span className="text-[10px] text-green-600 font-bold tracking-wider">ОБНОВЛЕНО</span>
+                  </div>
+                </div>
+
+                {/* Map Legend Card */}
+                <div className="absolute bottom-4 left-4 w-52 bg-white/95 backdrop-blur border border-slate-300 rounded shadow-xl p-3 z-20 pointer-events-auto">
+                  <h4 className="text-[10px] font-mono font-bold text-slate-800 tracking-wider uppercase mb-1 flex items-center gap-1.5">
+                    <Info className="w-3.5 h-3.5 text-[#00509A]" />
+                    <span>ЛЕГЕНДА КАРТЫ (OSM)</span>
+                  </h4>
+                  <p className="text-[10px] text-slate-600 leading-snug">
+                    Кликните на метку, чтобы открыть всплывающую карточку, а затем кнопку получения информации.
+                  </p>
+                  <div className="mt-2.5 pt-2 border-t border-slate-200/70 flex flex-col gap-1 text-[9px] font-mono text-slate-500">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2.5 h-2.5 bg-[#007A33] rounded-full shadow-[0_0_4px_rgba(0,122,51,0.3)]"></div>
+                      <span className="font-medium">ТПУ</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2.5 h-2.5 bg-[#00509A] rounded-full shadow-[0_0_4px_rgba(0,80,154,0.3)]"></div>
+                      <span className="font-medium font-bold text-[#00509A]">Росатом</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-2.5 h-2.5 bg-purple-600 rounded-full shadow-[0_0_4px_rgba(147,51,234,0.3)]"></div>
+                      <span className="font-medium">Совместные</span>
+                    </div>
+                  </div>
+                </div>
+              </>
             ) : (
               <>
-                {/* The Yandex Map Container */}
+                {/* Yandex Map Container */}
                 <div id="map" ref={mapContainerRef} className="w-full h-full relative" style={{ minHeight: '350px' }}>
                   {/* Spinner loader while map SDK ready */}
-                  <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm z-10 flex items-center justify-center space-x-3 pointer-events-none transition-all duration-700 select-none" id="map-loading-pane">
-                    <Loader2 className="w-6 h-6 text-blue-500 animate-spin" />
-                    <span className="text-xs font-mono text-slate-400">ГЕНЕРАЦИЯ ГЕОКАРТЫ YANDEX MAPS...</span>
+                  <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm z-10 flex flex-col items-center justify-center space-y-4 pointer-events-auto transition-all duration-700 select-none text-center p-6" id="map-loading-pane">
+                    <div className="flex items-center space-x-3">
+                      <Loader2 className="w-6 h-6 text-blue-500 animate-spin" />
+                      <span className="text-xs font-mono text-slate-400">ГЕНЕРАЦИЯ ГЕОКАРТЫ YANDEX MAPS...</span>
+                    </div>
+                    
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg max-w-sm shadow-xl mt-2 select-none pointer-events-auto">
+                      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+                        Если Яндекс.Карты зависают во фрейме из-за ограничений домена или отсутствия ключа, переключитесь на <strong>Реальную карту (OSM)</strong>, которая грузится моментально без ключей.
+                      </p>
+                      <button 
+                        onClick={() => handleMapProviderChange('leaflet')}
+                        className="cursor-pointer bg-[#00509A] hover:bg-blue-600 text-white text-[11px] px-3 py-1.5 rounded font-bold transition duration-200 active:scale-95 inline-flex items-center gap-1"
+                      >
+                        <Globe className="w-3.5 h-3.5" />
+                        <span>Открыть карту OpenStreetMap</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -696,11 +954,11 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* HIGH-DENSITY MAP LEGEND CARD (Exactly matching template) */}
+                {/* HIGH-DENSITY MAP LEGEND CARD */}
                 <div className="absolute bottom-4 left-4 w-52 bg-white/95 backdrop-blur border border-slate-300 rounded shadow-xl p-3 z-20 pointer-events-auto">
                   <h4 className="text-[10px] font-mono font-bold text-slate-800 tracking-wider uppercase mb-1 flex items-center gap-1.5">
                     <Info className="w-3.5 h-3.5 text-[#00509A]" />
-                    <span>ЛЕГЕНДА КАРТЫ</span>
+                    <span>ЛЕГЕНДА КАРТЫ (YANDEX)</span>
                   </h4>
                   <p className="text-[10px] text-slate-600 leading-snug">
                     Наведите на точку на карте, чтобы увидеть детали местоположения и краткую сводку по предприятию.
